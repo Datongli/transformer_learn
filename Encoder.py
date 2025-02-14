@@ -3,6 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import math
+
+from pyexpat import features
 from torch.autograd import Variable  # torch中变量封装函数Variable
 import copy
 
@@ -88,32 +90,15 @@ def subsequent_mask(size: int):
     return torch.from_numpy(1 - subsequent_mask)
 
 
-def attention(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, mask: torch.Tensor=None, dropout: nn.Dropout=None):
+def clones(module: any, N: int):
     """
-    注意力机制的实现
-    :param query:查询
-    :param key:键
-    :param value:值
-    :param mask:掩码张量
-    :param dropout:抛弃层的失活率
-    :return:注意力表示和注意力张量
+    克隆函数，因为在多头注意力机制的实现中，用到多个结构相同的模型层
+    静态函数
+    :param module: 模型层
+    :param N: 要克隆的数量
+    :return: nn.ModuleList类型的模型层列表
     """
-    # query的最后一维度的大小，一般情况下等同于词嵌入维度
-    d_k = query.size(-1)
-    # 按照注意力公式计算注意力张量
-    scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(d_k)  # 注意力得分张量
-    # 判断是否使用掩码张量
-    if mask is not None:
-        # 使用tensor的masked_fill方法，将掩码张量和scores张量的每一位置比较
-        # 如果掩码张量在相应位置上是0，则用-1e9这个很小的值来替代
-        scores = scores.masked_fill(mask == 0, -1e9)
-    # 在scores的最后一个维度上进行softmax操作
-    p_attn = F.softmax(scores, dim=-1)
-    # 判断是否使用dropout
-    if dropout is not None:
-        dropout(p_attn)
-    # 最后完成p_attn和value张量的乘法，并返回query的注意力表示
-    return torch.matmul(p_attn, value), p_attn
+    return nn.ModuleList(copy.deepcopy(module) for _ in range(N))
 
 
 class MultiHeadedAttention(nn.Module):
@@ -124,7 +109,7 @@ class MultiHeadedAttention(nn.Module):
         :param embedding_dim: 词填充维度
         :param dropout: 抛弃层参数
         """
-        super(MultiHeadedAttention).__init__()
+        super(MultiHeadedAttention, self).__init__()
         # 使用测试中常用的assert语句，判断词填充维度是否可以被头数整除
         assert embedding_dim % head == 0
         # 得到每个头获得的分割词向量维度d_k
@@ -133,23 +118,39 @@ class MultiHeadedAttention(nn.Module):
         self.head = head
         # 获得线性层对象，内部是4个embedding_dim x embedding_dim矩阵
         # 4个的原因是，多头注意力机制中，Q,K,V各需要一个，在最后拼接的时候还需要一个
-        self.linears = self.clones(nn.Linear(embedding_dim, embedding_dim), 4)
+        self.linears = clones(nn.Linear(embedding_dim, embedding_dim), 4)
         # self.attn代表最后得到的注意力张量，初始化为None
         self.attn = None
         self.dropout = nn.Dropout(p=dropout)
 
 
     @staticmethod
-    def clones(module: any, N: int):
+    def attention(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, mask: torch.Tensor = None, dropout: nn.Dropout = None):
         """
-        克隆函数，因为在多头注意力机制的实现中，用到多个结构相同的模型层
-        静态函数
-        :param module: 模型层
-        :param N: 要克隆的数量
-        :return: nn.ModuleList类型的模型层列表
+        注意力机制的实现
+        :param query:查询
+        :param key:键
+        :param value:值
+        :param mask:掩码张量
+        :param dropout:抛弃层的失活率
+        :return:注意力表示和注意力张量
         """
-        return nn.ModuleList(copy.deepcopy(module) for _ in range(N))
-
+        # query的最后一维度的大小，一般情况下等同于词嵌入维度
+        d_k = query.size(-1)
+        # 按照注意力公式计算注意力张量
+        scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(d_k)  # 注意力得分张量
+        # 判断是否使用掩码张量
+        if mask is not None:
+            # 使用tensor的masked_fill方法，将掩码张量和scores张量的每一位置比较
+            # 如果掩码张量在相应位置上是0，则用-1e9这个很小的值来替代
+            scores = scores.masked_fill(mask == 0, -1e9)
+        # 在scores的最后一个维度上进行softmax操作
+        p_attn = F.softmax(scores, dim=-1)
+        # 判断是否使用dropout
+        if dropout is not None:
+            dropout(p_attn)
+        # 最后完成p_attn和value张量的乘法，并返回query的注意力表示
+        return torch.matmul(p_attn, value), p_attn
 
     def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, mask: torch.Tensor=None):
         """
@@ -166,6 +167,158 @@ class MultiHeadedAttention(nn.Module):
             mask = mask.unsqueeze(1)
         # 获得一个训练批次中的样本数量
         batch_size = query.size(0)
+        # 多头处理环节
+        # 利用zip将self.linears和(query, key, value)组合在一起，循环按照小的次数来（3次）
+        # 每一次取出的事self.linears中的一个线性层和(query, key, value)中的一个
+        # 在完成线性变换后，开始为每个头分割输入，利用view方法对线性变换的结果进行维度重塑
+        # 对第二维和第三维进行转置，每个头可以获得一部分词特征组成的句子
+        # 这样代表句子长度的维度（-1）和代表词向量的维度（self.d_k）可以相邻，注意力机制更加方便找到词义和句子位置的关系
+        query, key, value = \
+            [model(x).view(batch_size, -1, self.head, self.d_k).transpose(1, 2)
+             for model, x in zip(self.linears, (query, key, value))]
+        # 得到每个头的输入后，传入attention中
+        x, self.attn = self.attention(query, key, value, mask=mask, dropout=self.dropout)
+        # 将计算得到的张量转换为和输入同样维度的张量
+        # 由于先对x进行了transpose操作，所以必须紧跟着进行contiguous操作，才可以进行view操作
+        x = x.transpose(1, 2).contiguous().view(batch_size, -1, self.head*self.d_k)
+        # 调用最后一个线性层作为多头注意力的输出
+        return self.linears[-1](x)
+
+
+class PositionwiseFeedForward(nn.Module):
+    """
+    前馈全连接层
+    """
+    def __init__(self, d_model, d_ff, dropout=0.1):
+        """
+        初始化函数
+        :param d_model: 词嵌入维度
+        :param d_ff: 中间节点数
+        :param dropout: 置零比例
+        """
+        super(PositionwiseFeedForward, self).__init__()
+        # 实例化两个线性层对象
+        self.w1 = nn.Linear(d_model, d_ff)
+        self.w2 = nn.Linear(d_ff, d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        x = self.w1(x)
+        x = F.relu(x)  # 非线性激活
+        x = self.dropout(x)
+        x = self.w2(x)
+        return x
+
+
+class LayerNorm(nn.Module):
+    """通过LayerNorm实现规范化层的类"""
+    def __init__(self, features, eps=1e-6):
+        """
+        初始化函数
+        :param features: 词嵌入维度
+        :param eps: 一个比较小的数，防止0在分母上出现
+        """
+        super(LayerNorm, self).__init__()
+        # 初始化两个参数
+        # 使用nn.Parameter封装，表示需要跟着模型进行训练
+        self.a2 = nn.Parameter(torch.ones(features))
+        self.b2 = nn.Parameter(torch.zeros(features))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor):
+        """
+        计算主函数
+        :param x: 输入的张量
+        :return: 规范化之后的张量
+        """
+        mean = x.mean(-1, keepdim=True)
+        std = x.std(-1, keepdim=True)
+        return self.a2 * (x - mean) / (std + self.eps) + self.b2
+
+
+class SublayerConnection(nn.Module):
+    """
+    子层连接结构的类
+    """
+    def __init__(self, size, dropout=0.1):
+        """
+        初始化函数
+        :param size: 词嵌入维度的大小
+        :param dropout: 置零比例
+        """
+        super(SublayerConnection, self).__init__()
+        # 实例化层归一化（注意和批量归一化BatchNorm的区别）
+        self.norm = LayerNorm(size)
+        self.dropout = nn.Dropout(p=dropout)
+
+    def forward(self, x, sublayer):
+        """
+        前向传播函数
+        :param x: 输入
+        :param sublayer: 连接中的子层函数
+        :return: 前向传播的计算结果
+        """
+        return x + self.dropout(sublayer(self.norm(x)))
+
+
+class EncoderLayer(nn.Module):
+    """
+    使用EncoderLayer类实现编码器层
+    """
+    def __init__(self, size: int, self_attn: MultiHeadedAttention, feed_forward: PositionwiseFeedForward, dropout: float):
+        """
+        初始化函数
+        :param size: 词嵌入维度的大小
+        :param self_attn: 多头注意力子层的实例化对象
+        :param feed_forward: 前馈全连接层的实例化对象
+        :param dropout: 置零比例
+        """
+        super(EncoderLayer, self).__init__()
+        self.size = size
+        self.self_attn = self_attn
+        self.feed_forward = feed_forward
+        # 由于编码器层中有两个子层连接结构，所以用clones函数进行克隆
+        self.sublayer = clones(SublayerConnection(size, dropout), 2)
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor):
+        """
+        前向传播函数
+        :param x: 输入张量
+        :param mask: 掩码张量
+        :return: 输出张量
+        """
+        # 第一个子层，多头注意力机制层
+        x = self.sublayer[0](x, lambda x: self.self_attn(x, x, x, mask))
+        # 第二个子层，前馈全连接层
+        return self.sublayer[1](x, self.feed_forward)
+
+
+class Encoder(nn.Module):
+    """
+    编码器类
+    """
+    def __init__(self, layer: EncoderLayer, N):
+        """
+        初始化函数
+        :param layer: 子层的类
+        :param N: N个子层
+        """
+        super(Encoder, self).__init__()
+        # 克隆N个编码器层
+        self.layers = clones(layer, N)
+        # 初始化一个规范化层，用在编码器的最后面
+        self.norm = LayerNorm(layer.size)
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor):
+        """
+        前向传播函数
+        :param x: 输入张量
+        :param mask: 掩码张量
+        :return: 输出张量
+        """
+        for layer in self.layers:
+            x = layer(x, mask)
+        return self.norm(x)
 
 
 
@@ -191,6 +344,61 @@ if __name__ == '__main__':
     mask = subsequent_mask(size)
     print("mask: ", mask)
     query = key = value = pe_result
-    attn, p_attn = attention(query, key, value)
+    attn, p_attn = MultiHeadedAttention.attention(query, key, value)  # 使用类的静态方法
     print("attn:", attn)
     print("p_attn:", p_attn)
+    head, embedding_dim, dropout = 8, 512, 0.2
+    mask = Variable(torch.zeros(1, 8, 4, 4))
+    mha = MultiHeadedAttention(head, embedding_dim, dropout)
+    mha_result = mha(query, key, value, mask)
+    print(mha_result)
+    print(mha_result.shape)
+    d_model, d_ff, dropout = 512, 64, 0.2
+    ff = PositionwiseFeedForward(d_model, d_ff, dropout)
+    ff_result = ff(mha_result)
+    print("ff_result:", ff_result)
+    print("shape of ff_result:", ff_result.shape)
+    features = d_model = 512
+    eps = 1e-6
+    ln = LayerNorm(features, eps)
+    ln_result = ln(ff_result)
+    print(ln_result)
+    print(ln_result.shape)
+    size = d_model = 512
+    head = 8
+    dropout = 0.2
+    mask = Variable(torch.zeros(1, 8, 4, 4))
+    self_attn = MultiHeadedAttention(head, d_model)
+    sublayer = lambda x: self_attn(x, x, x, mask)
+    sc = SublayerConnection(size, dropout)
+    sc_result = sc(pe_result, sublayer)
+    print("sc_result:", sc_result)
+    print("shape of sc_result:", sc_result.shape)
+    size = 512
+    head = 8
+    d_model = 512
+    d_ff = 64
+    x = pe_result
+    dropout = 0.2
+    self_attn = MultiHeadedAttention(head, d_model)
+    ff = PositionwiseFeedForward(d_model, d_ff, dropout)
+    mask = Variable(torch.zeros(1, 8, 4, 4))
+    el = EncoderLayer(size, self_attn, ff, dropout)
+    el_result = el(x, mask)
+    print(el_result)
+    print(el_result.shape)
+    size = 512
+    head = 8
+    d_model = 512
+    d_ff = 64
+    c = copy.deepcopy
+    attn = MultiHeadedAttention(head, d_model)
+    ff = PositionwiseFeedForward(d_model, d_ff, dropout)
+    dropout = 0.2
+    layer = EncoderLayer(size, c(attn), c(ff), dropout)
+    N = 8
+    mask = Variable(torch.zeros(1, 8, 4, 4))
+    en = Encoder(layer, N)
+    en_result = en(x, mask)
+    print(en_result)
+    print(en_result.shape)
