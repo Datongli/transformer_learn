@@ -251,7 +251,7 @@ class SublayerConnection(nn.Module):
         self.norm = LayerNorm(size)
         self.dropout = nn.Dropout(p=dropout)
 
-    def forward(self, x, sublayer):
+    def forward(self, x: torch.Tensor, sublayer):
         """
         前向传播函数
         :param x: 输入
