@@ -7,7 +7,7 @@ import torch.nn as nn
 
 class EncoderDecoder(nn.Module):
     def __init__(self, encoder: Encoder, decoder: Decoder,
-                 source_embed: Embedding, target_embed: Embedding, generator: Generator):
+                 source_embed: nn.Sequential, target_embed: nn.Sequential, generator: Generator):
         """
         初始化函数
         :param encoder: 编码器类对象
