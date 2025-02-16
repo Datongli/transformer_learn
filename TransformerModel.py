@@ -32,7 +32,7 @@ def make_model(source_vocab: int, target_vocab: int, N: int=6, d_model: int=512,
     # 如果参数的维度大于1，则会将其初始化成一个服从均匀分布的矩阵
     for p in model.parameters():
         if p.dim() > 1:
-            nn.init.xavier_uniform(p)
+            nn.init.xavier_uniform_(p)
     return model
 
 
